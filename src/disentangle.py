@@ -5,6 +5,7 @@ import random
 import sys
 import string
 import time
+from tqdm import tqdm
 
 import numpy as np
 
@@ -14,6 +15,7 @@ parser = argparse.ArgumentParser(description='IRC Conversation Disentangler.')
 
 # General arguments
 parser.add_argument('prefix', help="Start of names for files produced.")
+parser.add_argument('--gpu', default=False, action='store_true', help="Use GPU.")
 
 # Data arguments
 parser.add_argument('--train', nargs="+", help="Training files, e.g. train/*annotation.txt")
@@ -33,11 +35,12 @@ parser.add_argument('--nonlin', choices=["tanh", "cube", "logistic", "relu", "el
 # Inference arguments
 parser.add_argument('--max-dist', default=101, type=int, help="Maximum number of messages to consider when forming a link (count includes the current message).")
 parser.add_argument('--dynet-autobatch', action='store_true', help="Use dynet autobatching.")
+parser.add_argument('--append', dest='append', action='store_true', help="Whether to append to the output files or overwrite them.")
 
 # Training arguments
 parser.add_argument('--report-freq', default=5000, type=int, help="How frequently to evaluate on the development set.")
 parser.add_argument('--epochs', default=20, type=int, help="Maximum number of epochs.")
-parser.add_argument('--opt', choices=['sgd', 'mom'], default='sgd', help="Optimisation method.")
+parser.add_argument('--opt', choices=['sgd', 'mom', 'adam'], default='adam', help="Optimisation method.")
 parser.add_argument('--seed', default=10, type=int, help="Random seed.")
 parser.add_argument('--weight-decay', default=1e-7, type=float, help="Apply weight decay.")
 parser.add_argument('--learning-rate', default=0.018804, type=float, help="The initial learning rate.")
@@ -57,19 +60,24 @@ EPOCHS = args.epochs
 DROP = args.drop
 MAX_DIST = args.max_dist
 
+import dynet_config
+batching = 1 if args.dynet_autobatch else 0
+dynet_config.set(mem=512, autobatch=batching, weight_decay=WEIGHT_DECAY, random_seed=args.seed)
+if args.gpu:
+    dynet_config.set_gpu()
+import dynet as dy
+
+# open file to write predictions, append if it exists
+write_mode = 'a' if args.append else 'w'
+
 def header(args, out=sys.stdout):
     head_text = "# "+ time.ctime(time.time())
     head_text += "\n# "+ ' '.join(args)
     for outfile in out:
         print(head_text, file=outfile)
 
-log_file = open(args.prefix +".log", 'w')
+log_file = open(args.prefix +".log", write_mode)
 header(sys.argv, [log_file, sys.stdout])
-
-import dynet_config
-batching = 1 if args.dynet_autobatch else 0
-dynet_config.set(mem=512, autobatch=batching, weight_decay=WEIGHT_DECAY, random_seed=args.seed)
-import dynet as dy 
 
 from reserved_words import reserved
 
@@ -300,9 +308,12 @@ def get_features(name, query_no, link_no, text_ascii, text_tok, info, target_inf
     #  - Is the message before from the same user?
     features.append(link_no != query_no and link_no - 1 > 0 and luser == info[link_no - 1][0])
 
+    #print(f"info.query[{query_no}]: {info[query_no]}")
+    #print(f"info.link[{link_no}]: {info[link_no]}")
+
     # Both
     #  - Is this a self-link?
-    features.append(link_no == query_no)
+    features.append((link_no == query_no)*-40.0)
     #  - How far apart in messages are the two?
     dist = query_no - link_no
     features.append(min(100, dist) / 100)
@@ -352,7 +363,7 @@ def get_features(name, query_no, link_no, text_ascii, text_tok, info, target_inf
         features.append(False)
         features.append(False)
     #  - are they the same speaker?
-    features.append(luser == quser)
+    features.append((luser == quser)*-200.0)
     #  - do they have the same target?
     features.append(link_no != query_no and len(ltargets.intersection(qtargets)) > 0)
     #  - Do they have words in common?
@@ -382,6 +393,7 @@ def get_features(name, query_no, link_no, text_ascii, text_tok, info, target_inf
 
     if do_cache:
         cache[name, query_no, link_no] = final_features
+
     return final_features
 
 
@@ -390,15 +402,15 @@ def read_data(filenames, is_test=False):
     done = set()
     for filename in filenames:
         name = filename
-        for ending in [".annotation.txt", ".ascii.txt", ".raw.txt", ".tok.txt"]:
+        for ending in [".annotation.txt", ".raw.txt", ".txt.tok", ".txt"]:
             if filename.endswith(ending):
                 name = filename[:-len(ending)]
         if name in done:
             continue
         done.add(name)
-        text_ascii = [l.strip().split() for l in open(name +".ascii.txt")]
+        text_ascii = [l.strip().split() for l in open(name +".txt")]
         text_tok = []
-        for l in open(name +".tok.txt"):
+        for l in open(name +".txt.tok"):
             l = l.strip().split()
             if len(l) > 0 and l[-1] == "</s>":
                 l = l[:-1]
@@ -580,55 +592,73 @@ model = DyNetModel()
 optimizer = None
 if args.opt == 'sgd':
     optimizer = dy.SimpleSGDTrainer(model.model, learning_rate=LEARNING_RATE)
+elif args.opt == 'adam':
+    optimizer = dy.AdamTrainer(model.model, alpha=LEARNING_RATE)
 elif args.opt == 'mom':
     optimizer = dy.MomentumSGDTrainer(model.model, learning_rate=LEARNING_RATE, mom=MOMENTUM)
+    
+print("Optimiser: {}".format(args.opt))
+    
 optimizer.set_clip_threshold(args.clip)
 
 prev_best = None
 if args.train:
     step = 0
     for epoch in range(EPOCHS):
+        print(f"Epoch: {epoch}")
         random.shuffle(train)
 
         # Update learning rate
         optimizer.learning_rate = LEARNING_RATE / (1+ LEARNING_DECAY_RATE * epoch)
+
+        print(f"Learning rate: {optimizer.learning_rate}")
 
         # Loop over batches
         loss = 0
         match = 0
         total = 0
         loss_steps = 0
-        for instance in train:
-            step += 1
+        with tqdm(total=len(train)) as pbar:
+            for instance in train:
+                step += 1
+                dy.renew_cg()
+                ex_loss, matched, _ = do_instance(instance, True, model, optimizer)
+                loss += ex_loss
+                loss_steps += 1
+                if matched:
+                    match += 1
+                total += len(instance[2])
 
-            dy.renew_cg()
-            ex_loss, matched, _ = do_instance(instance, True, model, optimizer)
-            loss += ex_loss
-            loss_steps += 1
-            if matched:
-                match += 1
-            total += len(instance[2])
+                pbar.update(1)
+                pbar.set_postfix(loss=loss / loss_steps, acc=match / total)
 
-            # Partial results
-            if step % args.report_freq == 0:
-                # Dev pass
-                dev_match = 0
-                dev_total = 0
-                for dinstance in dev:
-                    dy.renew_cg()
-                    _, matched, _ = do_instance(dinstance, False, model, optimizer)
-                    if matched:
-                        dev_match += 1
-                    dev_total += len(dinstance[2])
+                # Partial results
+                if step % args.report_freq == 0:
+                #if True:
+                    # Dev pass
+                    dev_match = 0
+                    dev_total = 0
+                    my_count = 0
+                    for dinstance in dev:
+                        my_count+=1
+                        dy.renew_cg()
+                        _, matched, _ = do_instance(dinstance, False, model, optimizer)
+                        if matched:
+                            dev_match += 1
+                        dev_total += len(dinstance[2])
 
-                tacc = match / total
-                dacc = dev_match / dev_total
-                print("{} tl {:.3f} ta {:.3f} da {:.3f} from {} {}".format(epoch, loss / loss_steps, tacc, dacc, dev_match, dev_total), file=log_file)
-                log_file.flush()
+                    tacc = match / total
+                    dacc = dev_match / dev_total
+                    print("epoch: {}, loss/loss_steps {:.3f} ta {:.3f} da {:.3f} from {} {}".format(epoch, loss / loss_steps, tacc, dacc, dev_match, dev_total), file=log_file)
+                    log_file.flush()
 
-                if prev_best is None or prev_best[0] < dacc:
-                    prev_best = (dacc, epoch)
-                    model.model.save(args.prefix + ".dy.model")
+                    if prev_best is None or prev_best[0] < dacc:
+                        prev_best = (dacc, epoch)
+                        print("Saving model...")
+                        model.model.save(args.prefix + ".dy.model")
+                    else:
+                        model.model.save(args.prefix + ".checkpoint.dy.model")
+                        print("Saving model......")
 
         if prev_best is not None and epoch - prev_best[1] > 5:
             break
@@ -640,11 +670,23 @@ if prev_best is not None or args.model:
         location = args.prefix +".dy.model"
     model.model.populate(location)
 
-# Run on test instances
-for instance in test:
-    dy.renew_cg()
-    _, _, prediction = do_instance(instance, False, model, optimizer, False)
-    print("{}:{} {} -".format(instance[0], instance[1], instance[1] - prediction))
+links_file = open(args.prefix +".links.txt", write_mode)
+annotations_file = open(args.prefix +".annotations.txt", write_mode)
+
+# use tqdm to show progress
+num_links = 0
+with tqdm(total=len(test) + args.test_start, initial=args.test_start) as pbar:
+    for instance in test:
+        dy.renew_cg()
+        _, _, prediction = do_instance(instance, False, model, optimizer, False)
+        print("{} {}".format(instance[1], instance[1] - prediction), file=annotations_file)
+        annotations_file.flush()
+        if prediction != 0:
+            print("{} {}".format(instance[1], instance[1] - prediction), file=links_file)
+            links_file.flush()
+            num_links += 1
+        pbar.update(1)
+        pbar.set_postfix(links=num_links)
 
 log_file.close()
-
+annotations_file.close()
