@@ -10,6 +10,8 @@ The only dependency is the [DyNet library](http://dynet.readthedocs.io), which c
 pip3 install dynet
 ```
 
+> *** Make sure to [install the latest CUDA toolkit](https://developer.nvidia.com/cuda-downloads) first if you have an Nvidia GPU
+
 ## Running
 
 To see all options, run:
@@ -42,7 +44,8 @@ python3 disentangle.py \
   --seed 10 \
   --clip 3.740 \
   --weight-decay 1e-07 \
-  --opt sgd \
+  --opt adam \ # this option is only for GPU
+  --gpu \
   > example-train.out 2>example-train.err
 ```
 
@@ -60,11 +63,68 @@ python3 disentangle.py \
   --hidden 512 \
   --layers 2 \
   --nonlin softsign \
+  --max-dist 50 \ # default 100
   --word-vectors ../data/glove-ubuntu.txt \
+  --gpu \
   > example-run.1.out 2>example-run.1.err
 ```
 
-Note - the arguments defining the network (hidden, layers, nonlin), must match those given in training.
+>Note - the arguments defining the network (hidden, layers, nonlin), must match those given in training.
+
+### Running on a file
+
+If you want to apply a model to a file, see this script for an example of how to do it: `example-running.sh`.
+The script is set up so someone could call it like so (once the necessary placeholders in the script are set):
+
+`./example-running.sh sample.txt`
+
+This will write to several files:
+
+```
+todo.sample.0.log              # log file
+todo.sample.0.txt              # copy of sample.txt
+todo.sample.0.txt.tok          # tokenized version of sample.txt
+todo.sample.0.links.txt        # annotations with self-links removed
+todo.sample.0.annotations.txt  # annotations including self links
+```
+
+If the annotation process is interrupted, it can be resumed like so
+
+```
+./example-running.sh sample.txt --continue 0
+```
+
+This will pick up from the last annotation
+
+### Link
+
+Once inference has concluded, you can use `show.py` to show which lines were correlated
+
+```
+python show.py ../data/test/2005-07-06_14.annotation.txt ../data/test/2005-07-06_14.ascii.txt
+```
+
+Output:
+
+```
+[02:00] <jonbusby> well no, their java applet windows. I'm running firefox with sun-j2rel.5 java vm
+[01:59] <holycow> what java applet window?
+
+[02:00] <jonbusby> well no, their java applet windows. I'm running firefox with sun-j2rel.5 java vm
+[01:59] <enrico> what's the browser?
+
+[02:00] <holycow> okay, what site?
+[02:00] <jonbusby> well no, their java applet windows. I'm running firefox with sun-j2rel.5 java vm
+
+[02:00] <rob^> heh
+[01:59] <rasputnik> rob^: as a separate note, I get very pissed off applying for unix admin jobs and having to fill in an applicatin form in word format.
+
+[02:02] <holycow> stig_, unfortunately for now it requires a bit of work
+[02:02] <stig_> how can I get access to my NTFS files from ubuntu? (fresh newbie asking) :)
+
+[02:02] <holycow> a: you will only be able to read the ntfs files
+[02:02] <holycow> stig_, unfortunately for now it requires a bit of work
+```
 
 ### Evaluate
 
@@ -86,12 +146,7 @@ The second line is the precision, recall, and F-score.
 
 Note - the values in the paper are an average over 10 runs, so they will differ slightly from what you get here.
 
-### Running on a file
 
-If you want to apply a model to a file, see this script for an example of how to do it: `example-running.sh`.
-The script is set up so someone could call it like so (once the necessary placeholders in the script are set):
-
-./disentangle-file.sh < sample.ascii.txt > sample.links.txt
 
 ## Ensemble
 
